@@ -6,7 +6,7 @@
     targetRate: 9,      // desired syllable rate (syl/s) heard by user
     minSpeed: 1.0,
     maxSpeed: 3.5,
-    smoothing: 0.25,    // EMA alpha — faster for more obvious transitions
+    smoothingSec: 1.5,  // time constant of speed changes (s)
     silenceHoldSec: 3,  // seconds of silence before ramping toward 1×
   };
 
@@ -14,7 +14,6 @@
   let enabled = false;
   let settings = { ...DEFAULTS };
   let currentSpeed = 1.0;
-  let lastSpeechTime = 0;
 
   let activeVideo = null;
   let audioCtx = null;
@@ -24,33 +23,34 @@
   let overlayHost = null;
   let overlayEls = {};       // all overlay DOM refs
 
-  // Syllable detector: energy-envelope modulation via high-pass + zero-crossing.
-  // Old approach (threshold peak-counting) undercounted fast speech because
-  // energy stayed above threshold continuously. This approach isolates the
-  // syllable-rate modulation by high-passing the energy envelope, then counts
-  // positive-going zero-crossings of the filtered signal.
+  // Syllable detector: dB peak picking on a 10 ms energy envelope.
+  // The previous approach (zero-crossings of a high-passed 33 Hz envelope)
+  // could not resolve syllables once the video was sped up past ~2×, read
+  // that as slow speech and sped up further until it hit maxSpeed. Here every
+  // frame is stamped in media time (wall time × playbackRate), so the rate is
+  // the speaker's natural rate at any playback speed, and it is computed over
+  // voiced time only, so pauses don't make a speaker look slow.
   const detector = {
-    // Smoothed envelope (for silence gating & display)
-    envelope: 0,
-    envelopeAlpha: 0.3,
+    // Framing
+    frameSec: 0.01,          // 10 ms analysis frames
+    smoothFrames: 3,         // 30 ms power average, covers >= 2 pitch periods
 
-    // High-pass filter state: removes DC/slow drift from energy,
-    // leaving only syllable-rate modulation (2-10 Hz)
-    hpPrevInput: 0,
-    hpPrevOutput: 0,
-    hpAlpha: 0.9,           // cutoff ~0.5 Hz at 33 Hz polling
+    // Peak picking: a syllable nucleus is a peak with a dip of at least
+    // prominenceDb on both sides
+    prominenceDb: 3,
+    minPeakIntervalMs: 80,   // media ms — caps at 12.5 syl/s
 
-    // Zero-crossing detection on high-passed energy
-    prevFiltered: 0,
-    crossings: [],           // timestamps of positive-going zero crossings
-    lastCrossingTime: -1000,
-    minCrossingInterval: 70, // ms — caps at ~14 syl/s
+    // Voicing gate: louder than the noise floor + floorMarginDb and within
+    // peakRangeDb of recent speech peaks. Both levels drift back slowly.
+    floorMarginDb: 10,
+    peakRangeDb: 25,
+    driftDbPerSec: 2,
+    maxGapMs: 200,           // media ms — shorter dips are between syllables, not pauses
+    pauseSec: 0.25,          // wall s without voiced frames before speed is held
 
-    // Silence gate
-    minEnergy: 0.003,
-
-    // Window for rate computation
-    windowSize: 4000,        // ms
+    // Rate window
+    windowMs: 6000,          // media ms
+    minVoicedMs: 1000,       // media ms of speech needed before trusting the rate
   };
 
   // Scrolling log buffer (last N entries)
@@ -64,10 +64,10 @@
     videoSrc: '',
     streamTracks: 0,
     pollTicks: 0,
-    lastEnergy: 0,
-    lastThreshold: 0,
-    lastPeakCount: 0,
-    lastMeasuredRate: 0,
+    levelDb: -120,
+    thresholdDb: -120,
+    peakCount: 0,
+    voicedSec: 0,
     lastNaturalRate: 0,
     lastTargetSpeed: 0,
     silenceSec: 0,
@@ -196,20 +196,17 @@
       lowpass.frequency.value = 3000;
       lowpass.Q.value = 0.7;
 
+      // Only the samples rendered since the previous poll are analysed; the
+      // large buffer is headroom so a late timer tick doesn't lose audio.
       analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = 2048;
+      analyserNode.fftSize = 16384;
       analyserNode.smoothingTimeConstant = 0;
 
       sourceNode.connect(highpass);
       highpass.connect(lowpass);
       lowpass.connect(analyserNode);
 
-      detector.envelope = 0;
-      detector.hpPrevInput = 0;
-      detector.hpPrevOutput = 0;
-      detector.prevFiltered = 0;
-      detector.crossings = [];
-      detector.lastCrossingTime = -1000;
+      resetDetector();
 
       const buf = new Float32Array(analyserNode.fftSize);
       pollTimer = setInterval(() => pollAnalyser(buf), 30);
@@ -219,7 +216,6 @@
 
       createOverlay();
       currentSpeed = video.playbackRate || 1;
-      lastSpeechTime = performance.now() / 1000;
       logEntries = [];
     } catch (err) {
       diag.stage = 'ERROR: ' + err.message;
@@ -228,88 +224,173 @@
   }
 
   // ===== Syllable detection =====
+  function resetDetector() {
+    const d = detector;
+    const now = performance.now();
+    d.frameLen = Math.round(audioCtx.sampleRate * d.frameSec);
+    d.frameSum = 0;
+    d.frameFill = 0;
+    d.pw = new Float64Array(d.smoothFrames);
+    d.pwIdx = 0;
+    d.pwCount = 0;
+    d.mediaMs = 0;           // media time of audio analysed so far
+    d.floorDb = Infinity;
+    d.peakDb = -Infinity;
+    d.rising = true;
+    d.candMaxDb = -Infinity;
+    d.candT = 0;
+    d.candMinDb = Infinity;
+    d.lastPeakT = -Infinity;
+    d.peaks = [];            // media timestamps of syllable nuclei
+    d.voiced = [];           // [media time, media duration] of voiced frames
+    d.gap = [];              // unvoiced frames that may still be a dip between syllables
+    d.gapMs = 0;
+    d.rate = 0;              // natural syllables per voiced second
+    d.lastCtxTime = audioCtx.currentTime;
+    d.lastPollWall = now;
+    d.lastVoicedWall = now;
+  }
+
   function pollAnalyser(buffer) {
     if (!analyserNode) return;
-    analyserNode.getFloatTimeDomainData(buffer);
+    const d = detector;
     diag.pollTicks++;
     const now = performance.now();
+    const ctxTime = audioCtx.currentTime;
+    let n = Math.round((ctxTime - d.lastCtxTime) * audioCtx.sampleRate);
+    d.lastCtxTime = ctxTime;
 
-    let sum = 0;
-    for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
-    const rms = Math.sqrt(sum / buffer.length);
-
-    // Smooth envelope for silence gating & display
-    detector.envelope += detector.envelopeAlpha * (rms - detector.envelope);
-
-    // High-pass filter: removes DC/slow drift, isolates syllable-rate modulation
-    const filtered = detector.hpAlpha * (detector.hpPrevOutput + rms - detector.hpPrevInput);
-    detector.hpPrevInput = rms;
-    detector.hpPrevOutput = filtered;
-
-    // Count positive-going zero-crossings of filtered energy (each = 1 syllable)
-    if (filtered > 0 && detector.prevFiltered <= 0 &&
-        detector.envelope > detector.minEnergy &&
-        (now - detector.lastCrossingTime) >= detector.minCrossingInterval) {
-      detector.crossings.push(now);
-      detector.lastCrossingTime = now;
+    // Paused, seeking or buffering: drop the audio and stop the clocks, so
+    // neither the silence timer nor the speed smoothing jumps on resume
+    if (activeVideo && (activeVideo.paused || activeVideo.seeking || activeVideo.readyState < 3)) {
+      d.lastVoicedWall += now - d.lastPollWall;
+      d.lastPollWall = now;
+      return;
     }
-    detector.prevFiltered = filtered;
 
-    // Compute rate over sliding window
-    const cutoff = now - detector.windowSize;
-    detector.crossings = detector.crossings.filter((t) => t >= cutoff);
-    const elapsed = Math.min(diag.pollTicks * 30, detector.windowSize) / 1000;
-    const syllableRate = elapsed > 0.5 ? detector.crossings.length / elapsed : 0;
+    // Cut the samples rendered since the previous poll into frames
+    analyserNode.getFloatTimeDomainData(buffer);
+    n = Math.min(Math.max(n, 0), buffer.length);
+    const frameMediaMs = d.frameLen / audioCtx.sampleRate * 1000 * (activeVideo ? activeVideo.playbackRate : 1);
+    for (let i = buffer.length - n; i < buffer.length; i++) {
+      d.frameSum += buffer[i] * buffer[i];
+      if (++d.frameFill === d.frameLen) {
+        processFrame(d.frameSum / d.frameLen, frameMediaMs, now);
+        d.frameSum = 0;
+        d.frameFill = 0;
+      }
+    }
 
-    diag.lastEnergy = detector.envelope;
-    diag.lastThreshold = filtered;  // show filtered signal for debugging
-    diag.lastPeakCount = detector.crossings.length;
-    diag.lastMeasuredRate = syllableRate;
+    // Rate = syllables per voiced second over the last windowMs of media
+    const cutoff = d.mediaMs - d.windowMs;
+    while (d.peaks.length && d.peaks[0] < cutoff) d.peaks.shift();
+    while (d.voiced.length && d.voiced[0][0] < cutoff) d.voiced.shift();
+    let voicedMs = 0;
+    for (const v of d.voiced) voicedMs += v[1];
+    if (voicedMs >= d.minVoicedMs) d.rate = d.peaks.length / (voicedMs / 1000);
+
+    const dt = (now - d.lastPollWall) / 1000;
+    d.lastPollWall = now;
+    const silenceSec = (now - d.lastVoicedWall) / 1000;
+
+    diag.peakCount = d.peaks.length;
+    diag.voicedSec = voicedMs / 1000;
+    diag.silenceSec = silenceSec;
 
     if (!enabled || !activeVideo) return;
 
     const shouldLog = diag.pollTicks % 66 === 0;
-    const nowSec = now / 1000;
 
-    // Silence
-    if (syllableRate < 0.5 || detector.envelope < 0.002) {
-      const silenceDuration = nowSec - lastSpeechTime;
-      diag.silenceSec = silenceDuration;
+    // Pause: hold the speed, then ease back toward 1× after silenceHoldSec
+    if (d.rate === 0 || silenceSec > d.pauseSec) {
       diag.lastNaturalRate = 0;
       diag.lastTargetSpeed = currentSpeed;
-      if (silenceDuration > settings.silenceHoldSec) {
-        currentSpeed += 0.03 * (1 - currentSpeed);
+      if (silenceSec > settings.silenceHoldSec) {
+        currentSpeed += (1 - Math.exp(-dt)) * (1 - currentSpeed);
         applySpeed();
       }
       if (shouldLog) {
-        log('SILENCE  energy=%.5f  filtered=%.5f  silence=%.1fs  speed=%.2f',
-            detector.envelope, filtered, silenceDuration, currentSpeed);
+        log('SILENCE  level=%.1f dB  threshold=%.1f dB  silence=%.1fs  speed=%.2f',
+            diag.levelDb, diag.thresholdDb, silenceSec, currentSpeed);
       }
       addLogEntry(now, 0, currentSpeed, 'silence');
       updateOverlay();
       return;
     }
 
-    lastSpeechTime = nowSec;
-    diag.silenceSec = 0;
-
-    const naturalRate = syllableRate / currentSpeed;
-    diag.lastNaturalRate = naturalRate;
-
-    const targetSpeed = settings.targetRate / naturalRate;
+    // No division by the playback speed: the rate is already in media time
+    diag.lastNaturalRate = d.rate;
+    const targetSpeed = settings.targetRate / d.rate;
     const clamped = Math.max(settings.minSpeed, Math.min(settings.maxSpeed, targetSpeed));
     diag.lastTargetSpeed = clamped;
 
-    currentSpeed += settings.smoothing * (clamped - currentSpeed);
+    currentSpeed += (1 - Math.exp(-dt / settings.smoothingSec)) * (clamped - currentSpeed);
 
     if (shouldLog) {
-      log('SPEECH  crossings=%d  measured=%.1f  natural=%.1f syl/s  target=%.2fx  speed=%.2fx  filtered=%.5f',
-          detector.crossings.length, syllableRate, naturalRate, clamped, currentSpeed, filtered);
+      log('SPEECH  peaks=%d  voiced=%.1fs  natural=%.1f syl/s  target=%.2fx  speed=%.2fx',
+          d.peaks.length, voicedMs / 1000, d.rate, clamped, currentSpeed);
     }
 
     applySpeed();
-    addLogEntry(now, naturalRate, currentSpeed, 'speech');
+    addLogEntry(now, d.rate, currentSpeed, 'speech');
     updateOverlay();
+  }
+
+  // One 10 ms frame: update the levels, voiced time and peak picker.
+  function processFrame(power, dm, now) {
+    const d = detector;
+    d.pw[d.pwIdx] = power;
+    d.pwIdx = (d.pwIdx + 1) % d.pw.length;
+    if (d.pwCount < d.pw.length) d.pwCount++;
+    let sum = 0;
+    for (let i = 0; i < d.pwCount; i++) sum += d.pw[i];
+    const db = 10 * Math.log10(sum / d.pwCount + 1e-12);
+    d.mediaMs += dm;
+    const t = d.mediaMs;
+
+    // Noise floor follows the quietest frames, speech level the loudest;
+    // both drift back so they keep adapting
+    const drift = d.driftDbPerSec * d.frameSec;
+    d.floorDb = db < d.floorDb ? db : d.floorDb + drift;
+    d.peakDb = db > d.peakDb ? db : d.peakDb - drift;
+    const threshold = Math.max(d.floorDb + d.floorMarginDb, d.peakDb - d.peakRangeDb);
+    diag.levelDb = db;
+    diag.thresholdDb = threshold;
+
+    // Voiced time; dips shorter than maxGapMs are between syllables and count
+    if (db > threshold) {
+      if (d.gapMs < d.maxGapMs) d.voiced.push(...d.gap);
+      d.gap = [];
+      d.gapMs = 0;
+      d.voiced.push([t, dm]);
+      d.lastVoicedWall = now;
+    } else if (d.gapMs < d.maxGapMs) {
+      d.gap.push([t, dm]);
+      d.gapMs += dm;
+    }
+
+    // Peak picker with hysteresis: a peak counts once the level has fallen
+    // prominenceDb below it, and the next one can only start after rising
+    // prominenceDb above the dip
+    if (d.rising) {
+      if (db > d.candMaxDb) {
+        d.candMaxDb = db;
+        d.candT = t;
+      } else if (db < d.candMaxDb - d.prominenceDb) {
+        if (d.candMaxDb > threshold && d.candT - d.lastPeakT >= d.minPeakIntervalMs) {
+          d.peaks.push(d.candT);
+          d.lastPeakT = d.candT;
+        }
+        d.rising = false;
+        d.candMinDb = db;
+      }
+    } else if (db < d.candMinDb) {
+      d.candMinDb = db;
+    } else if (db > d.candMinDb + d.prominenceDb) {
+      d.rising = true;
+      d.candMaxDb = db;
+      d.candT = t;
+    }
   }
 
   function addLogEntry(now, naturalRate, speed, state) {
@@ -523,7 +604,7 @@
     }
 
     // Energy bar
-    const barPct = Math.min(100, Math.max(0, (Math.log10(diag.lastEnergy + 1e-6) + 5) * 25));
+    const barPct = Math.min(100, Math.max(0, (diag.levelDb + 100) * 1.25));
     e.bar.style.width = barPct + '%';
 
     // Scrolling log
@@ -541,7 +622,7 @@
     e.log.innerHTML = html;
 
     // Stats
-    e.peaks.textContent = 'xings: ' + diag.lastPeakCount;
+    e.peaks.textContent = 'peaks: ' + diag.peakCount + ' / ' + diag.voicedSec.toFixed(1) + 's';
     e.ticks.textContent = 'ticks: ' + diag.pollTicks;
     e.stage.textContent = diag.stage;
   }
